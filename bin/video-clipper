@@ -1,0 +1,504 @@
+#!/usr/bin/env bash
+# video-clipper — download a video with yt-dlp, optionally as a set of time
+# segments that are stitched back into one file, and report progress as
+# newline-delimited JSON events on stdout.
+#
+# Every event line is prefixed with @@CLIP@@ so the caller can ignore anything
+# yt-dlp or ffmpeg writes that we did not wrap ourselves.
+#
+#   video-clipper --url URL --outdir DIR [--section START-END]... [options]
+#
+# Sections are given in seconds; an empty END means "to the end of the video".
+# All working files live in a hidden directory inside --outdir (so the final
+# move is a rename, not a copy) and are removed on every exit path.
+
+set -uo pipefail
+
+# ------------------------------------------------------------------ events
+
+json_escape() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
+# emit <type> [key value]...  — values are always emitted as JSON strings.
+emit() {
+  local out="{\"type\":\"$1\""
+  shift
+  while (($# >= 2)); do
+    out+=",\"$1\":\"$(json_escape "$2")\""
+    shift 2
+  done
+  printf '@@CLIP@@%s}\n' "$out"
+}
+
+die() {
+  emit error message "$1"
+  exit 1
+}
+
+# ------------------------------------------------------------------- args
+
+url=""
+outdir=""
+quality="best"
+container="mp4"
+filename=""
+cookies="none"
+concurrent=4
+audio_only=0
+prefer_h264=1
+accurate_cuts=1
+force_container=1
+declare -a sections=()
+
+while (($#)); do
+  case $1 in
+    --url) url=${2-}; shift 2 ;;
+    --outdir) outdir=${2-}; shift 2 ;;
+    --quality) quality=${2-}; shift 2 ;;
+    --container) container=${2-}; shift 2 ;;
+    --filename) filename=${2-}; shift 2 ;;
+    --cookies-from) cookies=${2-}; shift 2 ;;
+    --concurrent) concurrent=${2-}; shift 2 ;;
+    --section) sections+=("${2-}"); shift 2 ;;
+    --audio-only) audio_only=1; shift ;;
+    --prefer-h264) prefer_h264=1; shift ;;
+    --no-prefer-h264) prefer_h264=0; shift ;;
+    --accurate-cuts) accurate_cuts=1; shift ;;
+    --no-accurate-cuts) accurate_cuts=0; shift ;;
+    --force-container) force_container=1; shift ;;
+    --no-force-container) force_container=0; shift ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+[[ -n $url ]] || die "no URL given"
+[[ -n $outdir ]] || die "no output directory given"
+command -v yt-dlp >/dev/null || die "yt-dlp is not installed"
+command -v ffmpeg >/dev/null || die "ffmpeg is not installed"
+command -v ffprobe >/dev/null || die "ffprobe is not installed"
+
+# Expand a leading ~ ourselves: the argv arrives from the shell plugin, so bash
+# never got a chance to do it.
+case $outdir in
+  "~") outdir=$HOME ;;
+  "~/"*) outdir=$HOME/${outdir#\~/} ;;
+esac
+mkdir -p -- "$outdir" || die "cannot create output directory: $outdir"
+[[ -w $outdir ]] || die "output directory is not writable: $outdir"
+
+[[ $concurrent =~ ^[0-9]+$ ]] || concurrent=4
+((concurrent < 1)) && concurrent=1
+((concurrent > 16)) && concurrent=16
+
+target_ext=$container
+((audio_only)) && target_ext="m4a"
+
+# ------------------------------------------------------- workspace + signals
+
+work=$(mktemp -d "$outdir/.video-clipper.XXXXXXXX") || die "cannot create a working directory in $outdir"
+
+cleanup() {
+  [[ -n ${work:-} && -d $work ]] && rm -rf -- "$work"
+}
+trap cleanup EXIT
+
+cancelled=0
+child=""
+
+on_signal() {
+  cancelled=1
+  [[ -n $child ]] && kill -TERM "$child" 2>/dev/null
+}
+trap on_signal TERM INT HUP
+
+# Run a command with its output streamed line by line into $1, keeping the
+# child's pid visible to the signal handler so a cancel actually stops it.
+run_streamed() {
+  local handler=$1
+  shift
+  local fifo="$work/stream.fifo"
+  rm -f -- "$fifo"
+  mkfifo "$fifo" || return 1
+
+  "$@" >"$fifo" 2>&1 &
+  child=$!
+
+  local line
+  while IFS= read -r line; do "$handler" "$line"; done <"$fifo"
+
+  wait "$child"
+  local rc=$?
+  child=""
+  rm -f -- "$fifo"
+  return $rc
+}
+
+# ------------------------------------------------------------ line handlers
+
+last_error=""
+declare -a tail_lines=()
+
+remember_line() {
+  tail_lines+=("$1")
+  ((${#tail_lines[@]} > 6)) && tail_lines=("${tail_lines[@]: -6}")
+}
+
+ytdlp_line() {
+  local line=$1
+  case $line in
+    "@P@|"*)
+      local _tag status downloaded total speed eta
+      IFS='|' read -r _tag status downloaded total speed eta <<<"$line"
+      emit progress status "$status" downloaded "$downloaded" total "$total" speed "$speed" eta "$eta"
+      ;;
+    "@X@|"*)
+      local _t status pp
+      IFS='|' read -r _t status pp <<<"$line"
+      [[ $status == started ]] && emit stage stage "postprocess" detail "$pp"
+      ;;
+    out_time_us=*)
+      # ffmpeg's own progress while it pulls a section: how far into the
+      # segment it has written, in microseconds.
+      local us=${line#out_time_us=}
+      [[ $us =~ ^[0-9]+$ ]] && emit segtime seconds "$((us / 1000000))"
+      ;;
+    progress=* | frame=* | fps=* | bitrate=* | total_size=* | out_time=* | out_time_ms=* | speed=* | dup_frames=* | drop_frames=* | stream_*)
+      ;;
+    ERROR:*)
+      last_error=${line#ERROR: }
+      remember_line "$line"
+      emit log line "$line"
+      ;;
+    *)
+      [[ -n ${line//[[:space:]]/} ]] || return 0
+      remember_line "$line"
+      emit log line "$line"
+      ;;
+  esac
+}
+
+merge_target=0
+ffmpeg_line() {
+  local line=$1
+  case $line in
+    out_time_us=*)
+      local us=${line#out_time_us=}
+      [[ $us =~ ^[0-9]+$ ]] || return 0
+      if ((merge_target > 0)); then
+        emit merge seconds "$((us / 1000000))" total "$merge_target"
+      fi
+      ;;
+    progress=* | frame=* | fps=* | bitrate=* | total_size=* | out_time=* | out_time_ms=* | speed=* | dup_frames=* | drop_frames=* | stream_*)
+      ;;
+    *)
+      [[ -n ${line//[[:space:]]/} ]] || return 0
+      remember_line "$line"
+      ;;
+  esac
+}
+
+fail_with() {
+  local fallback=$1
+  if ((cancelled)); then
+    emit cancelled
+    exit 130
+  fi
+  local detail=$last_error
+  [[ -z $detail && ${#tail_lines[@]} -gt 0 ]] && detail=${tail_lines[-1]}
+  emit error message "${detail:-$fallback}"
+  exit 1
+}
+
+# --------------------------------------------------------------- yt-dlp args
+
+declare -a common_args=(
+  --no-playlist
+  --newline
+  --no-colors
+  --progress-delta 0.4
+  --progress-template "download:@P@|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes,progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s"
+  --progress-template "postprocess:@X@|%(progress.status)s|%(progress.postprocessor)s"
+  --concurrent-fragments "$concurrent"
+  # Section downloads are handed to ffmpeg, which otherwise reports nothing we
+  # can parse. Asking it for machine-readable progress is what lets the panel
+  # say which second of the video it has reached.
+  --downloader-args "ffmpeg_o:-progress pipe:2 -nostats"
+)
+[[ $cookies != none && -n $cookies ]] && common_args+=(--cookies-from-browser "$cookies")
+
+declare -a format_args=()
+if ((audio_only)); then
+  format_args+=(-f "ba/b" -x --audio-format m4a)
+else
+  if [[ $quality == best ]]; then
+    format_args+=(-f "bv*+ba/b")
+  else
+    format_args+=(-f "bv*[height<=$quality]+ba/b[height<=$quality]/b[height<=$quality]/bv*+ba/b")
+  fi
+  # Prefer the codecs that stream-copy cleanly into mp4, so stitching segments
+  # back together stays a remux instead of a re-encode.
+  ((prefer_h264)) && format_args+=(-S "vcodec:h264,acodec:aac")
+  format_args+=(--merge-output-format "$container")
+fi
+
+# ------------------------------------------------------------------- probe
+
+emit stage stage "probe"
+
+probe_out=$(yt-dlp --no-playlist --no-warnings --skip-download \
+  --print "%(title)s" --print "%(duration)s" -- "$url" 2>"$work/probe.err")
+probe_rc=$?
+
+title=""
+duration=""
+if ((probe_rc == 0)); then
+  title=$(printf '%s\n' "$probe_out" | sed -n '1p')
+  duration=$(printf '%s\n' "$probe_out" | sed -n '2p')
+  [[ $duration =~ ^[0-9]+(\.[0-9]+)?$ ]] || duration=""
+else
+  # A failed probe is not fatal on its own (some extractors refuse --print but
+  # download fine); surface it only if the download fails too.
+  last_error=$(tail -n 1 "$work/probe.err" 2>/dev/null | sed 's/^ERROR: //')
+fi
+((cancelled)) && { emit cancelled; exit 130; }
+
+# A blank title is left blank: the panel then shows the URL, which is more
+# useful than a placeholder when the probe is what failed.
+emit info title "$title" duration "${duration:-0}" sections "${#sections[@]}"
+
+# ----------------------------------------------------------------- download
+
+# Each download lands in its own empty directory, so whatever yt-dlp decides to
+# call the file, it is the only thing in there when we go looking for it.
+only_file_in() {
+  find "$1" -maxdepth 1 -type f ! -name '*.part' ! -name '*.ytdl' ! -name '*.temp' \
+    -printf '%s\t%p\n' 2>/dev/null | sort -rn | head -n 1 | cut -f2-
+}
+
+declare -a pieces=()
+
+if ((${#sections[@]} == 0)); then
+  emit stage stage "download"
+  emit segment index "1" total "1" start "0" end "${duration:-0}"
+  mkdir -p "$work/whole"
+  run_streamed ytdlp_line yt-dlp "${common_args[@]}" "${format_args[@]}" \
+    -o "$work/whole/media.%(ext)s" -- "$url"
+  rc=$?
+  ((cancelled)) && { emit cancelled; exit 130; }
+  ((rc == 0)) || fail_with "yt-dlp exited with status $rc"
+  produced=$(only_file_in "$work/whole")
+  [[ -n $produced ]] || fail_with "yt-dlp produced no file"
+  pieces+=("$produced")
+else
+  index=0
+  for section in "${sections[@]}"; do
+    ((index++))
+    start=${section%%-*}
+    end=${section#*-}
+    [[ -n $end ]] || end="inf"
+
+    emit stage stage "download"
+    emit segment index "$index" total "${#sections[@]}" start "$start" end "$end"
+
+    segdir="$work/seg-$index"
+    mkdir -p "$segdir"
+
+    declare -a section_args=(--download-sections "*${start}-${end}")
+    ((accurate_cuts)) && section_args+=(--force-keyframes-at-cuts)
+
+    run_streamed ytdlp_line yt-dlp "${common_args[@]}" "${format_args[@]}" \
+      "${section_args[@]}" -o "$segdir/clip.%(ext)s" -- "$url"
+    rc=$?
+    ((cancelled)) && { emit cancelled; exit 130; }
+    ((rc == 0)) || fail_with "segment $index failed (yt-dlp exited with status $rc)"
+
+    produced=$(only_file_in "$segdir")
+    [[ -n $produced ]] || fail_with "segment $index produced no file"
+    pieces+=("$produced")
+  done
+fi
+
+# -------------------------------------------------------------------- join
+
+probe_duration() {
+  local d
+  d=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 -- "$1" 2>/dev/null)
+  [[ $d =~ ^[0-9]+(\.[0-9]+)?$ ]] || d=0
+  printf '%s' "$d"
+}
+
+expected=0
+for piece in "${pieces[@]}"; do
+  expected=$(awk -v a="$expected" -v b="$(probe_duration "$piece")" 'BEGIN { printf "%.3f", a + b }')
+done
+merge_target=${expected%.*}
+((merge_target < 1)) && merge_target=1
+
+concat_list="$work/concat.txt"
+: >"$concat_list"
+for piece in "${pieces[@]}"; do
+  # The concat demuxer takes a single-quoted path; escape any quote in it.
+  printf "file '%s'\n" "${piece//\'/\'\\\'\'}" >>"$concat_list"
+done
+
+joined="$work/joined.$target_ext"
+
+join_copy() {
+  rm -f -- "$joined"
+  run_streamed ffmpeg_line ffmpeg -hide_banner -nostdin -loglevel error -y \
+    -progress pipe:1 -f concat -safe 0 -i "$concat_list" \
+    -c copy -movflags +faststart -- "$joined"
+}
+
+probe_field() {
+  ffprobe -v error -select_streams "$2" -show_entries "stream=$3" \
+    -of default=nw=1:nk=1 -- "$1" 2>/dev/null | head -n 1
+}
+
+has_audio() {
+  [[ -n $(probe_field "$1" a:0 codec_name) ]]
+}
+
+# The concat demuxer only ever copies, so it needs every input to carry
+# identical streams. When that is not true — a webm segment next to an mp4 one,
+# or two different resolutions — fall back to the concat *filter*, which
+# normalises geometry, frame rate and audio layout before joining.
+join_encode() {
+  rm -f -- "$joined"
+
+  local n=${#pieces[@]}
+  local -a inputs=()
+  local k
+  for ((k = 0; k < n; k++)); do inputs+=(-i "${pieces[k]}"); done
+
+  local -a encode_args=()
+  local filter="" concat_in="" vfilter="" afilter=""
+  local extra=0
+
+  if ((!audio_only)); then
+    local tw=0 th=0 tfps=0 w h rate fps
+    for ((k = 0; k < n; k++)); do
+      w=$(probe_field "${pieces[k]}" v:0 width)
+      h=$(probe_field "${pieces[k]}" v:0 height)
+      rate=$(probe_field "${pieces[k]}" v:0 r_frame_rate)
+      [[ $w =~ ^[0-9]+$ ]] && ((w > tw)) && tw=$w
+      [[ $h =~ ^[0-9]+$ ]] && ((h > th)) && th=$h
+      fps=$(awk -v r="$rate" 'BEGIN { split(r, a, "/"); if (a[2] + 0 > 0) printf "%d", (a[1] / a[2]) + 0.5; else print 0 }')
+      [[ $fps =~ ^[0-9]+$ ]] && ((fps > tfps)) && tfps=$fps
+    done
+    ((tw < 2)) && tw=1280
+    ((th < 2)) && th=720
+    ((tw % 2)) && ((tw++))
+    ((th % 2)) && ((th++))
+    ((tfps < 1)) && tfps=30
+    ((tfps > 60)) && tfps=60
+
+    for ((k = 0; k < n; k++)); do
+      vfilter+="[$k:v:0]scale=$tw:$th:force_original_aspect_ratio=decrease,"
+      vfilter+="pad=$tw:$th:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=$tfps,format=yuv420p[v$k];"
+      concat_in+="[v$k][a$k]"
+    done
+    encode_args=(-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -c:a aac -b:a 192k)
+  else
+    for ((k = 0; k < n; k++)); do concat_in+="[a$k]"; done
+    encode_args=(-vn -c:a aac -b:a 192k)
+  fi
+
+  for ((k = 0; k < n; k++)); do
+    if has_audio "${pieces[k]}"; then
+      afilter+="[$k:a:0]"
+    else
+      # concat refuses a stream that is missing from one input, so pad the
+      # silent pieces with a matching run of silence.
+      local silence
+      silence=$(probe_duration "${pieces[k]}")
+      awk -v d="$silence" 'BEGIN { exit !(d > 0) }' || silence=1
+      inputs+=(-f lavfi -t "$silence" -i "anullsrc=r=48000:cl=stereo")
+      afilter+="[$((n + extra)):a:0]"
+      ((extra++))
+    fi
+    afilter+="aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a$k];"
+  done
+
+  if ((audio_only)); then
+    filter="${afilter}${concat_in}concat=n=$n:v=0:a=1[aout]"
+    run_streamed ffmpeg_line ffmpeg -hide_banner -nostdin -loglevel error -y \
+      -progress pipe:1 "${inputs[@]}" -filter_complex "$filter" -map "[aout]" \
+      "${encode_args[@]}" -movflags +faststart -- "$joined"
+  else
+    filter="${vfilter}${afilter}${concat_in}concat=n=$n:v=1:a=1[vout][aout]"
+    run_streamed ffmpeg_line ffmpeg -hide_banner -nostdin -loglevel error -y \
+      -progress pipe:1 "${inputs[@]}" -filter_complex "$filter" -map "[vout]" -map "[aout]" \
+      "${encode_args[@]}" -movflags +faststart -- "$joined"
+  fi
+}
+
+joined_is_sane() {
+  [[ -s $joined ]] || return 1
+  local got
+  got=$(probe_duration "$joined")
+  awk -v got="$got" -v want="$expected" 'BEGIN { exit !(want <= 0 || (got > want * 0.75 && got < want * 1.25)) }'
+}
+
+single_piece_ready=0
+if ((${#pieces[@]} == 1)); then
+  piece_ext=${pieces[0]##*.}
+  if [[ $piece_ext == "$target_ext" || $force_container -eq 0 ]]; then
+    single_piece_ready=1
+    joined=${pieces[0]}
+    target_ext=$piece_ext
+  fi
+fi
+
+if ((!single_piece_ready)); then
+  emit stage stage "merge" detail "${#pieces[@]}"
+  join_copy
+  ((cancelled)) && { emit cancelled; exit 130; }
+  if ! joined_is_sane; then
+    # Stream copy could not produce a valid file (mismatched codecs, or a
+    # container that will not hold them) — fall back to a real re-encode.
+    emit stage stage "encode" detail "${#pieces[@]}"
+    join_encode
+    ((cancelled)) && { emit cancelled; exit 130; }
+    joined_is_sane || fail_with "could not combine the segments into one $target_ext"
+  fi
+fi
+
+# -------------------------------------------------------------------- name
+
+sanitize() {
+  local s=$1
+  s=${s//\//-}
+  s=$(printf '%s' "$s" | tr -d '\000-\037' | tr -s ' ')
+  s=${s#"${s%%[![:space:].]*}"}
+  s=${s%"${s##*[![:space:].]}"}
+  printf '%s' "${s:0:150}"
+}
+
+base=$(sanitize "${filename:-${title:-video}}")
+[[ -n $base ]] || base="video"
+if ((${#sections[@]} > 1)); then
+  base="$base (${#sections[@]} clips)"
+elif ((${#sections[@]} == 1)); then
+  base="$base (clip)"
+fi
+
+dest="$outdir/$base.$target_ext"
+counter=2
+while [[ -e $dest ]]; do
+  dest="$outdir/$base ($counter).$target_ext"
+  ((counter++))
+done
+
+emit stage stage "finalize"
+mv -- "$joined" "$dest" || fail_with "could not move the finished file into $outdir"
+
+emit done path "$dest" dir "$outdir" name "$(basename -- "$dest")"
+exit 0

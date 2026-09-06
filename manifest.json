@@ -1,0 +1,123 @@
+{
+  "schemaVersion": 1,
+  "id": "vaguely.video-clipper",
+  "name": "Video Clipper",
+  "version": "1.0.0",
+  "author": "VaguelyOnline",
+  "license": "MIT",
+  "description": "Download a video with yt-dlp straight from the bar, either whole or as any number of time segments that are stitched back into a single MP4. Downloads queue up and run one at a time, progress reports which segment is in flight and roughly where in the video it has reached, and every working file is removed when the job ends. Nothing is written to disk except the finished video.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Video Clipper",
+    "description": "Queue yt-dlp downloads and stitch time segments into one file.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "outputDir": "~/Videos",
+      "quality": "best",
+      "container": "mp4",
+      "cookiesFrom": "none",
+      "concurrentFragments": 4,
+      "audioOnly": false,
+      "preferH264": true,
+      "accurateCuts": true,
+      "forceContainer": true,
+      "notifyOnComplete": true
+    },
+    "schema": [
+      {
+        "key": "outputDir",
+        "type": "string",
+        "label": "Default output folder",
+        "defaultValue": "~/Videos"
+      },
+      {
+        "key": "quality",
+        "type": "enum",
+        "label": "Default maximum quality",
+        "options": [
+          "best",
+          "2160",
+          "1440",
+          "1080",
+          "720",
+          "480"
+        ],
+        "defaultValue": "best"
+      },
+      {
+        "key": "container",
+        "type": "enum",
+        "label": "Default container",
+        "options": [
+          "mp4",
+          "mkv"
+        ],
+        "defaultValue": "mp4"
+      },
+      {
+        "key": "cookiesFrom",
+        "type": "enum",
+        "label": "Take cookies from browser",
+        "options": [
+          "none",
+          "firefox",
+          "chromium",
+          "chrome",
+          "brave",
+          "vivaldi",
+          "edge"
+        ],
+        "defaultValue": "none"
+      },
+      {
+        "key": "concurrentFragments",
+        "type": "integer",
+        "label": "Parallel fragment downloads",
+        "min": 1,
+        "max": 16,
+        "step": 1,
+        "defaultValue": 4
+      },
+      {
+        "key": "audioOnly",
+        "type": "boolean",
+        "label": "Audio only by default",
+        "defaultValue": false
+      },
+      {
+        "key": "preferH264",
+        "type": "boolean",
+        "label": "Prefer H.264 / AAC",
+        "defaultValue": true
+      },
+      {
+        "key": "accurateCuts",
+        "type": "boolean",
+        "label": "Accurate cuts on segments",
+        "defaultValue": true
+      },
+      {
+        "key": "forceContainer",
+        "type": "boolean",
+        "label": "Always produce the chosen container",
+        "defaultValue": true
+      },
+      {
+        "key": "notifyOnComplete",
+        "type": "boolean",
+        "label": "Notify when a download finishes",
+        "defaultValue": true
+      }
+    ]
+  }
+}
