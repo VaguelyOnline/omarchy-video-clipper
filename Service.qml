@@ -201,8 +201,14 @@ Item {
     Util.execArgv(["xdg-open", String(path)])
   }
 
-  function notify(title, body) {
-    Util.execArgv(["notify-send", "-a", "Video Clipper", String(title), String(body)])
+  // Deliberately says nothing about what was downloaded. Omarchy persists the
+  // newest notifications as one JSON file each under
+  // ~/.local/state/omarchy/notifications/history/, so naming the file here
+  // would leave a record of it on disk — the history this plugin otherwise
+  // takes care not to keep. The finished job is named in the panel instead,
+  // which lives only in memory.
+  function notify(title) {
+    Util.execArgv(["notify-send", "-a", "Video Clipper", String(title)])
   }
 
   // ------------------------------------------------------------- events
@@ -263,7 +269,7 @@ Item {
       queueModel.setProperty(index, "percent", 100)
       queueModel.setProperty(index, "outputPath", String(event.path || ""))
       queueModel.setProperty(index, "outputName", String(event.name || ""))
-      if (notifyOnComplete) notify("Download finished", String(event.name || ""))
+      if (notifyOnComplete) notify("Download finished")
       jobCompleted(String(event.name || ""), String(event.dir || ""))
       break
 

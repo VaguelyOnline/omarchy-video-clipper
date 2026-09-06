@@ -24,6 +24,11 @@ paste and go.
   opens the directory with `xdg-open`.
 - Nothing is written to disk but the finished video. The queue lives in memory
   for the life of the shell session; there is no history file.
+- The completion notification is deliberately generic — "Download finished",
+  with no file name. Omarchy keeps the newest notifications as JSON files under
+  `~/.local/state/omarchy/notifications/history/`, so naming the file there
+  would put a record of it on disk. Turn the notification off entirely with
+  `"notifyOnComplete": false`.
 
 ## Joining segments
 
