@@ -11,6 +11,10 @@
 # Sections are given in seconds; an empty END means "to the end of the video".
 # All working files live in a hidden directory inside --outdir (so the final
 # move is a rename, not a copy) and are removed on every exit path.
+#
+# --login-stdin reads a site login from stdin — the username on the first line,
+# the password on the second — so neither ever appears in argv, where any
+# process on the machine could read it.
 
 set -uo pipefail
 
@@ -55,6 +59,7 @@ audio_only=0
 prefer_h264=1
 accurate_cuts=1
 force_container=1
+login_stdin=0
 declare -a sections=()
 
 while (($#)); do
@@ -74,9 +79,18 @@ while (($#)); do
     --no-accurate-cuts) accurate_cuts=0; shift ;;
     --force-container) force_container=1; shift ;;
     --no-force-container) force_container=0; shift ;;
+    --login-stdin) login_stdin=1; shift ;;
     *) die "unknown argument: $1" ;;
   esac
 done
+
+login_user=""
+login_pass=""
+if ((login_stdin)); then
+  IFS= read -r -t 10 login_user || true
+  IFS= read -r -t 10 login_pass || true
+  [[ -n $login_user && -n $login_pass ]] || die "a login needs both a username and a password"
+fi
 
 [[ -n $url ]] || die "no URL given"
 [[ -n $outdir ]] || die "no output directory given"
@@ -171,6 +185,9 @@ ytdlp_line() {
       ;;
     progress=* | frame=* | fps=* | bitrate=* | total_size=* | out_time=* | out_time_ms=* | speed=* | dup_frames=* | drop_frames=* | stream_*)
       ;;
+    "Reading options from STDIN"*)
+      # yt-dlp announcing that it is reading the login config — not news.
+      ;;
     ERROR:*)
       last_error=${line#ERROR: }
       remember_line "$line"
@@ -218,6 +235,33 @@ fail_with() {
 
 # --------------------------------------------------------------- yt-dlp args
 
+# Shared by the probe and every download, so a video that needs a login is read
+# with the same identity it is fetched with.
+declare -a auth_args=()
+[[ $cookies != none && -n $cookies ]] && auth_args+=(--cookies-from-browser "$cookies")
+
+# yt-dlp reads the login as a config file on its own stdin (--config-locations
+# -), again keeping it out of argv. The text is quoted for shlex, which is how
+# yt-dlp splits a config. --no-cache-dir stops extractors that cache a session
+# token from leaving it under ~/.cache/yt-dlp.
+shlex_quote() {
+  printf "'%s'" "${1//\'/\'\\\'\'}"
+}
+login_config=""
+if [[ -n $login_user ]]; then
+  login_config="--username $(shlex_quote "$login_user") --password $(shlex_quote "$login_pass")"
+  auth_args+=(--config-locations - --no-cache-dir)
+fi
+
+# Every yt-dlp run goes through here so it gets the login on stdin. The exec
+# matters: run in the background, the subshell becomes yt-dlp itself, so the
+# pid run_streamed hands to the signal handler is the one a cancel must kill.
+# It must only ever run in a subshell (background or $(...)) — called directly,
+# the exec would replace this script.
+ytdlp() {
+  exec yt-dlp "$@" < <(printf '%s\n' "$login_config")
+}
+
 declare -a common_args=(
   --no-playlist
   --newline
@@ -230,8 +274,8 @@ declare -a common_args=(
   # can parse. Asking it for machine-readable progress is what lets the panel
   # say which second of the video it has reached.
   --downloader-args "ffmpeg_o:-progress pipe:2 -nostats"
+  "${auth_args[@]}"
 )
-[[ $cookies != none && -n $cookies ]] && common_args+=(--cookies-from-browser "$cookies")
 
 declare -a format_args=()
 if ((audio_only)); then
@@ -252,7 +296,7 @@ fi
 
 emit stage stage "probe"
 
-probe_out=$(yt-dlp --no-playlist --no-warnings --skip-download \
+probe_out=$(ytdlp --no-playlist --no-warnings --skip-download "${auth_args[@]}" \
   --print "%(title)s" --print "%(duration)s" -- "$url" 2>"$work/probe.err")
 probe_rc=$?
 
@@ -288,7 +332,7 @@ if ((${#sections[@]} == 0)); then
   emit stage stage "download"
   emit segment index "1" total "1" start "0" end "${duration:-0}"
   mkdir -p "$work/whole"
-  run_streamed ytdlp_line yt-dlp "${common_args[@]}" "${format_args[@]}" \
+  run_streamed ytdlp_line ytdlp "${common_args[@]}" "${format_args[@]}" \
     -o "$work/whole/media.%(ext)s" -- "$url"
   rc=$?
   ((cancelled)) && { emit cancelled; exit 130; }
@@ -313,7 +357,7 @@ else
     declare -a section_args=(--download-sections "*${start}-${end}")
     ((accurate_cuts)) && section_args+=(--force-keyframes-at-cuts)
 
-    run_streamed ytdlp_line yt-dlp "${common_args[@]}" "${format_args[@]}" \
+    run_streamed ytdlp_line ytdlp "${common_args[@]}" "${format_args[@]}" \
       "${section_args[@]}" -o "$segdir/clip.%(ext)s" -- "$url"
     rc=$?
     ((cancelled)) && { emit cancelled; exit 130; }

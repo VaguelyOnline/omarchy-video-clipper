@@ -54,6 +54,25 @@ almost every time.
 | Prefer H.264 / AAC | on | Picks codecs that stitch without a re-encode |
 | Always produce the chosen container | on | Remux when the site hands back something else |
 | Audio only | off | Saves an `m4a` |
+| Site username / Password | blank | Logs in with yt-dlp's `--username` / `--password` — see below |
+
+## Logging in
+
+Some sites need an account. There are two ways to give yt-dlp one:
+
+- **Cookies from** borrows a browser's signed-in session. It works on any site
+  and is the only option for YouTube.
+- **Site username / Password** has yt-dlp sign in itself. That only works on
+  sites whose yt-dlp extractor implements a login (Vimeo, Udemy, Nebula,
+  Twitch and around 80 others); elsewhere yt-dlp warns and carries on
+  anonymously. A login that needs a CAPTCHA or a second factor will fail.
+
+The password is held in memory for the shell session and is never written
+anywhere: there is no setting for it, and it reaches the worker over stdin,
+then each `yt-dlp` run as a config on stdin (`--config-locations -`), so it
+never appears in a command line that other processes could read. Runs with a
+login also pass `--no-cache-dir`, so a session token is not cached under
+`~/.cache/yt-dlp`. The username can be given a default with `"username"`.
 
 Defaults come from the widget's entry in `~/.config/omarchy/shell.json`, so a
 folder or quality you always want can be set once:
@@ -81,7 +100,8 @@ bin/video-clipper --url URL --outdir ~/Videos --section 90-165 --section 300-330
 ```
 
 It writes one JSON event per line, each prefixed with `@@CLIP@@`, which is what
-the panel reads.
+the panel reads. Add `--login-stdin` to feed it a username and password on the
+first two lines of stdin.
 
 ## Requires
 

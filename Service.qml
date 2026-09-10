@@ -24,6 +24,11 @@ Item {
 
   readonly property alias queue: queueModel
 
+  // Site logins, keyed by job id. Kept out of the queue model so nothing that
+  // renders the queue can read a password, and handed to the worker over stdin
+  // so it never reaches argv. Forgotten once the job succeeds or is removed.
+  property var credentials: ({})
+
   // Rolled up for the bar button: how much is outstanding and how far the
   // current download has got.
   property int activeCount: 0
@@ -68,11 +73,18 @@ Item {
   }
 
   // spec: { url, segments[], outputDir, quality, container, filename, cookies,
-  //         concurrent, audioOnly, preferH264, accurateCuts, forceContainer }
+  //         concurrent, audioOnly, preferH264, accurateCuts, forceContainer,
+  //         username, password }
   function enqueue(spec) {
     var segments = spec.segments instanceof Array ? spec.segments : []
+    var jobId = nextJobId++
+    var username = String(spec.username || "")
+    var password = String(spec.password || "")
+    var hasLogin = username !== "" && password !== ""
+    if (hasLogin) credentials[jobId] = { username: username, password: password }
+
     queueModel.append({
-      jobId: nextJobId++,
+      jobId: jobId,
       url: String(spec.url || ""),
       title: "",
       segmentsJson: JSON.stringify(segments),
@@ -86,6 +98,7 @@ Item {
       preferH264: spec.preferH264 !== false,
       accurateCuts: spec.accurateCuts !== false,
       forceContainer: spec.forceContainer !== false,
+      hasLogin: hasLogin,
       state: "queued",
       stage: "",
       detail: "",
@@ -103,7 +116,11 @@ Item {
     })
     refreshSummary()
     pump()
-    return nextJobId - 1
+    return jobId
+  }
+
+  function forgetCredentials(jobId) {
+    delete credentials[jobId]
   }
 
   function pump() {
@@ -121,6 +138,8 @@ Item {
     queueModel.setProperty(index, "stage", "probe")
     runningJobId = job.jobId
     sawTerminalEvent = false
+    var login = job.hasLogin ? credentials[job.jobId] : null
+    runner.login = login ? login.username + "\n" + login.password + "\n" : ""
     runner.command = buildArguments(job)
     runner.running = true
     refreshSummary()
@@ -141,6 +160,7 @@ Item {
     ]
     if (job.audioOnly) argv.push("--audio-only")
     if (job.filename !== "") argv.push("--filename", job.filename)
+    if (job.hasLogin) argv.push("--login-stdin")
 
     var sections = Clip.sectionArguments(Clip.decodeSegments(job.segmentsJson))
     for (var i = 0; i < sections.length; i++) argv.push("--section", sections[i])
@@ -169,13 +189,18 @@ Item {
       runner.running = false
       return
     }
+    forgetCredentials(jobId)
     queueModel.remove(index)
     refreshSummary()
   }
 
   function clearFinished() {
-    for (var i = queueModel.count - 1; i >= 0; i--)
-      if (isTerminal(queueModel.get(i).state)) queueModel.remove(i)
+    for (var i = queueModel.count - 1; i >= 0; i--) {
+      var job = queueModel.get(i)
+      if (!isTerminal(job.state)) continue
+      forgetCredentials(job.jobId)
+      queueModel.remove(i)
+    }
     refreshSummary()
   }
 
@@ -269,6 +294,7 @@ Item {
       queueModel.setProperty(index, "percent", 100)
       queueModel.setProperty(index, "outputPath", String(event.path || ""))
       queueModel.setProperty(index, "outputName", String(event.name || ""))
+      forgetCredentials(job.jobId)
       if (notifyOnComplete) notify("Download finished")
       jobCompleted(String(event.name || ""), String(event.dir || ""))
       break
@@ -365,6 +391,15 @@ Item {
 
   Process {
     id: runner
+    // "username\npassword\n" for a job with a login, else empty. Written once
+    // the worker is up (it reads it for --login-stdin) and dropped straight
+    // after, so it does not outlive the hand-off.
+    property string login: ""
+    stdinEnabled: true
+    onStarted: {
+      if (login !== "") write(login)
+      login = ""
+    }
     stdout: SplitParser { onRead: function(line) { root.handleLine(line) } }
     stderr: SplitParser { onRead: function(line) { root.handleLine(line) } }
     onExited: function(exitCode, exitStatus) { root.finishRun(exitCode) }

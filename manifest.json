@@ -31,7 +31,8 @@
       "preferH264": true,
       "accurateCuts": true,
       "forceContainer": true,
-      "notifyOnComplete": true
+      "notifyOnComplete": true,
+      "username": ""
     },
     "schema": [
       {
@@ -117,6 +118,12 @@
         "type": "boolean",
         "label": "Notify when a download finishes",
         "defaultValue": true
+      },
+      {
+        "key": "username",
+        "type": "string",
+        "label": "Default site login username (the password is never stored)",
+        "defaultValue": ""
       }
     ]
   }

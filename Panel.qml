@@ -43,6 +43,10 @@ Panel {
   property bool preferH264: true
   property bool accurateCuts: true
   property bool forceContainer: true
+  // A site login. The password is held here for the shell session only —
+  // there is deliberately no setting for it, so it is never written to disk.
+  property string username: ""
+  property string password: ""
   property string formError: ""
 
   readonly property int queueCount: service ? service.queue.count : 0
@@ -58,6 +62,7 @@ Panel {
     preferH264 = setting("preferH264", true) !== false
     accurateCuts = setting("accurateCuts", true) !== false
     forceContainer = setting("forceContainer", true) !== false
+    username = String(setting("username", ""))
     if (service) service.notifyOnComplete = setting("notifyOnComplete", true) !== false
   }
 
@@ -106,6 +111,12 @@ Panel {
       formError = "Choose a folder to save into"
       return
     }
+    var login = String(username).trim()
+    if ((login === "") !== (password === "")) {
+      formError = "A login needs both a username and a password"
+      advancedOpen = true
+      return
+    }
 
     var segments = []
     if (segmentMode) {
@@ -134,7 +145,9 @@ Panel {
       audioOnly: audioOnly,
       preferH264: preferH264,
       accurateCuts: accurateCuts,
-      forceContainer: forceContainer
+      forceContainer: forceContainer,
+      username: login,
+      password: password
     })
 
     // Clear only what belongs to this download; the options stay put so a
@@ -602,6 +615,49 @@ Panel {
               placeholderText: "File name (blank uses the video title)"
               onTextChanged: root.draftFilename = text
               Keys.onEscapePressed: root.close()
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.spacing.controlGap
+
+              TextField {
+                id: usernameField
+                width: (parent.width - Style.spacing.controlGap) / 2
+                foreground: root.foreground
+                font.family: root.fontFamily
+                placeholderText: "Site username"
+                Component.onCompleted: text = root.username
+                onTextChanged: {
+                  root.username = text
+                  if (root.formError !== "") root.formError = ""
+                }
+                Keys.onEscapePressed: root.close()
+              }
+
+              TextField {
+                id: passwordField
+                width: (parent.width - Style.spacing.controlGap) / 2
+                password: true
+                foreground: root.foreground
+                font.family: root.fontFamily
+                placeholderText: "Password"
+                onTextChanged: {
+                  root.password = text
+                  if (root.formError !== "") root.formError = ""
+                }
+                Keys.onEscapePressed: root.close()
+              }
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              text: "Login only works on sites yt-dlp can sign in to (not YouTube — use cookies there). The password is kept in memory for this session and never saved."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
             }
 
             Repeater {
